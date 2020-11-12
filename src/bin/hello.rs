@@ -5,6 +5,11 @@ use cortex_m::peripheral::DWT;
 use embedded_hal::digital::ToggleableOutputPin;
 use nucleo_usb as _;
 use rtic::cyccnt::{Instant, U32Ext as _};
+use smoltcp::socket::{SocketHandle, SocketSetItem};
+use stm32_eth::smoltcp::iface::{EthernetInterfaceBuilder, NeighborCache};
+use stm32_eth::smoltcp::socket::{SocketSet, TcpSocket, TcpSocketBuffer};
+use stm32_eth::smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
+use stm32_eth::{Eth, EthPins, PhyAddress, RingEntry};
 use stm32f7xx_hal::delay::Delay;
 use stm32f7xx_hal::gpio::gpiob::PB;
 use stm32f7xx_hal::gpio::{Output, PushPull};
@@ -16,6 +21,9 @@ use usb_device::prelude::*;
 use usbd_serial::SerialPort;
 
 const PERIOD: u32 = 16_000_000;
+const MS_PERIOD: u32 = 216_000;
+
+const SRC_MAC: [u8; 6] = [0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
 
 #[rtic::app(device = stm32f7xx_hal::pac, peripherals = true, monotonic = rtic::cyccnt::CYCCNT)]
 const APP: () = {
@@ -25,12 +33,22 @@ const APP: () = {
         // red_led: PB<Output<PushPull>>
         serial: SerialPort<'static, UsbBusType>,
         usb_dev: UsbDevice<'static, UsbBusType>,
+        #[init(0)]
+        time: u64,
+        #[init(false)]
+        eth_pending: bool,
+        server_handle: SocketHandle,
+        sockets: SocketSet<'static, 'static, 'static>,
     }
 
-    #[init(schedule = [blink, blink_blue])]
+    #[init(schedule = [blink, blink_blue, ms_tick])]
     fn init(cx: init::Context) -> init::LateResources {
         static mut EP_MEMORY: [u32; 1024] = [0; 1024];
         static mut USB_BUS: Option<UsbBusAllocator<UsbBusType>> = None;
+
+        static mut SOCKETS_STORAGE: [Option<SocketSetItem<'static, 'static>>; 2] = [None, None];
+        static mut SERVER_RX_BUFFER: [u8; 2048] = [0; 2048];
+        static mut SERVER_TX_BUFFER: [u8; 2048] = [0; 2048];
 
         let mut core: rtic::Peripherals = cx.core;
         let device: stm32f7xx_hal::pac::Peripherals = cx.device;
@@ -46,19 +64,67 @@ const APP: () = {
             .cfgr
             .sysclk(216.mhz())
             .use_pll()
-            .use_pll48clk();
+            .use_pll48clk()
+            .hclk(50.mhz());
         let clocks = rcc.freeze();
 
+        let gpioa = device.GPIOA.split();
         let gpiob = device.GPIOB.split();
+        let gpioc = device.GPIOC.split();
+        let gpiog = device.GPIOG.split();
+
         let green_led = gpiob.pb0.into_push_pull_output().downgrade();
         let blue_led = gpiob.pb7.into_push_pull_output().downgrade();
         let red_led = gpiob.pb14.into_push_pull_output().downgrade();
 
-        let now = cx.start;
-        cx.schedule.blink(now + PERIOD.cycles());
-        cx.schedule.blink_blue(now + PERIOD.cycles());
+        let eth_pins = EthPins {
+            ref_clk: gpioa.pa1,
+            md_io: gpioa.pa2,
+            md_clk: gpioc.pc1,
+            crs: gpioa.pa7,
+            tx_en: gpiog.pg11,
+            tx_d0: gpiog.pg13,
+            tx_d1: gpiob.pb13,
+            rx_d0: gpioc.pc4,
+            rx_d1: gpioc.pc5,
+        };
 
-        let gpioa = device.GPIOA.split();
+        let mut rx_ring: [RingEntry<_>; 8] = Default::default();
+        let mut tx_ring: [RingEntry<_>; 2] = Default::default();
+        let mut eth = Eth::new(
+            device.ETHERNET_MAC,
+            device.ETHERNET_DMA,
+            &mut rx_ring[..],
+            &mut tx_ring[..],
+            PhyAddress::_0,
+            clocks,
+            eth_pins,
+        )
+        .unwrap();
+        eth.enable_interrupt();
+
+        let local_addr = Ipv4Address::new(10, 0, 0, 1);
+        let ip_addr = IpCidr::new(IpAddress::from(local_addr), 24);
+        let mut ip_addrs = [ip_addr];
+        let mut neighbor_storage = [None; 16];
+        let neighbor_cache = NeighborCache::new(&mut neighbor_storage[..]);
+        let ethernet_addr = EthernetAddress(SRC_MAC);
+        let mut iface = EthernetInterfaceBuilder::new(&mut eth)
+            .ethernet_addr(ethernet_addr)
+            .ip_addrs(&mut ip_addrs[..])
+            .neighbor_cache(neighbor_cache)
+            .finalize();
+
+        let mut server_rx_buffer = [0; 2048];
+        let mut server_tx_buffer = [0; 2048];
+        let server_socket = TcpSocket::new(
+            TcpSocketBuffer::new(unsafe { SERVER_RX_BUFFER.as_mut() }),
+            TcpSocketBuffer::new(unsafe { SERVER_TX_BUFFER.as_mut() }),
+        );
+
+        let mut sockets = SocketSet::new(unsafe { SOCKETS_STORAGE.as_mut() });
+        let server_handle = sockets.add(server_socket);
+
         let usb = USB::new(
             device.OTG_FS_GLOBAL,
             device.OTG_FS_DEVICE,
@@ -86,24 +152,28 @@ const APP: () = {
         .device_class(usbd_serial::USB_CLASS_CDC)
         .build();
 
+        let now = cx.start;
+        cx.schedule.blink(now + PERIOD.cycles());
+        cx.schedule.blink_blue(now + PERIOD.cycles());
+        cx.schedule.ms_tick(now + MS_PERIOD.cycles());
+
         init::LateResources {
             green_led,
             blue_led,
             serial,
             usb_dev,
+            server_handle,
+            sockets,
         }
     }
 
-    #[idle(resources = [green_led])]
-    fn idle(cx: idle::Context) -> ! {
-        // let led: &mut PB<Output<PushPull>> = cx.resources.led;
+    #[idle(resources = [eth_pending, time])]
+    fn idle(mut cx: idle::Context) -> ! {
+        let pending: &mut bool = cx.resources.eth_pending;
         loop {
+            let time: u64 = cx.resources.time.lock(|time| *time);
+            *pending = false;
             cortex_m::asm::nop();
-            // delay.delay_ms(100u8);
-            // // led.set_high();
-            // delay.delay_ms(100u8);
-            // led.set_low();
-            // defmt::warn!("Kurdebele, jo se na to vyserim.");
         }
     }
 
@@ -135,6 +205,13 @@ const APP: () = {
         };
     }
 
+    #[task(binds = ETH, resources = [])]
+    fn eth_handler(cx: eth_handler::Context) {
+        // Clear interrupt flags
+        let p = unsafe { pac::Peripherals::steal() };
+        stm32_eth::eth_interrupt_handler(&p.ETHERNET_DMA);
+    }
+
     #[task(resources = [green_led], schedule = [blink])]
     fn blink(cx: blink::Context) {
         let led: &mut PB<Output<PushPull>> = cx.resources.green_led;
@@ -158,6 +235,15 @@ const APP: () = {
 
         cx.schedule
             .blink_blue(cx.scheduled + (2 * PERIOD).cycles())
+            .unwrap();
+    }
+
+    #[task(resources = [time], schedule = [ms_tick])]
+    fn ms_tick(cx: ms_tick::Context) {
+        *cx.resources.time += 1;
+
+        cx.schedule
+            .ms_tick(cx.scheduled + (MS_PERIOD).cycles())
             .unwrap();
     }
 
