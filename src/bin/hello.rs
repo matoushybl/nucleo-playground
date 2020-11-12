@@ -1,14 +1,17 @@
 #![no_main]
 #![no_std]
 
+use core::fmt::Write;
 use cortex_m::peripheral::DWT;
 use nucleo_usb as _;
-use rtic::cyccnt::{U32Ext as _};
+use rtic::cyccnt::U32Ext as _;
+use smoltcp::iface::{EthernetInterface, Neighbor};
 use smoltcp::socket::{SocketHandle, SocketSetItem};
 use stm32_eth::smoltcp::iface::{EthernetInterfaceBuilder, NeighborCache};
 use stm32_eth::smoltcp::socket::{SocketSet, TcpSocket, TcpSocketBuffer};
+use stm32_eth::smoltcp::time::Instant;
 use stm32_eth::smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
-use stm32_eth::{Eth, EthPins, PhyAddress, RingEntry};
+use stm32_eth::{Eth, EthPins, PhyAddress, RingEntry, RxDescriptor, TxDescriptor};
 use stm32f7xx_hal::gpio::gpiob::PB;
 use stm32f7xx_hal::gpio::{Output, PushPull};
 use stm32f7xx_hal::otg_fs::{UsbBus, UsbBusType, USB};
@@ -19,16 +22,19 @@ use usb_device::prelude::*;
 use usbd_serial::SerialPort;
 
 const PERIOD: u32 = 16_000_000;
-const MS_PERIOD: u32 = 216_000;
+const MS_PERIOD: u32 = 108_000;
 
 const SRC_MAC: [u8; 6] = [0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+
+type Ethernet = EthernetInterface<'static, 'static, 'static, &'static mut Eth<'static, 'static>>;
+type Sockets = SocketSet<'static, 'static, 'static>;
 
 #[rtic::app(device = stm32f7xx_hal::pac, peripherals = true, monotonic = rtic::cyccnt::CYCCNT)]
 const APP: () = {
     struct Resources {
         green_led: PB<Output<PushPull>>,
         blue_led: PB<Output<PushPull>>,
-        // red_led: PB<Output<PushPull>>
+        red_led: PB<Output<PushPull>>,
         serial: SerialPort<'static, UsbBusType>,
         usb_dev: UsbDevice<'static, UsbBusType>,
         #[init(0)]
@@ -36,13 +42,23 @@ const APP: () = {
         #[init(false)]
         eth_pending: bool,
         server_handle: SocketHandle,
-        sockets: SocketSet<'static, 'static, 'static>,
+        sockets: Sockets,
+        interface: Ethernet,
     }
 
     #[init(schedule = [blink, blink_blue, ms_tick])]
     fn init(cx: init::Context) -> init::LateResources {
         static mut EP_MEMORY: [u32; 1024] = [0; 1024];
         static mut USB_BUS: Option<UsbBusAllocator<UsbBusType>> = None;
+
+        static mut RX_RING: Option<[RingEntry<RxDescriptor>; 8]> = None;
+        static mut TX_RING: Option<[RingEntry<TxDescriptor>; 2]> = None;
+
+        static mut IP_ADDRS: Option<[IpCidr; 1]> = None;
+
+        static mut NEIGHBOR_STORAGE: [Option<(IpAddress, Neighbor)>; 16] = [None; 16];
+
+        static mut ETH: Option<Eth<'static, 'static>> = None;
 
         static mut SOCKETS_STORAGE: [Option<SocketSetItem<'static, 'static>>; 2] = [None, None];
         static mut SERVER_RX_BUFFER: [u8; 2048] = [0; 2048];
@@ -63,7 +79,7 @@ const APP: () = {
             .sysclk(216.mhz())
             .use_pll()
             .use_pll48clk()
-            .hclk(50.mhz());
+            .hclk(216.mhz());
         let clocks = rcc.freeze();
 
         let gpioa = device.GPIOA.split();
@@ -87,13 +103,14 @@ const APP: () = {
             rx_d1: gpioc.pc5,
         };
 
-        let mut rx_ring: [RingEntry<_>; 8] = Default::default();
-        let mut tx_ring: [RingEntry<_>; 2] = Default::default();
-        let mut eth = Eth::new(
+        *RX_RING = Some(Default::default());
+        *TX_RING = Some(Default::default());
+
+        let eth = Eth::new(
             device.ETHERNET_MAC,
             device.ETHERNET_DMA,
-            &mut rx_ring[..],
-            &mut tx_ring[..],
+            RX_RING.as_mut().unwrap(),
+            TX_RING.as_mut().unwrap(),
             PhyAddress::_0,
             clocks,
             eth_pins,
@@ -101,24 +118,24 @@ const APP: () = {
         .unwrap();
         eth.enable_interrupt();
 
-        let local_addr = Ipv4Address::new(10, 0, 0, 1);
-        let ip_addr = IpCidr::new(IpAddress::from(local_addr), 24);
-        let mut ip_addrs = [ip_addr];
-        let mut neighbor_storage = [None; 16];
-        let neighbor_cache = NeighborCache::new(&mut neighbor_storage[..]);
-        let ethernet_addr = EthernetAddress(SRC_MAC);
-        let mut iface = EthernetInterfaceBuilder::new(&mut eth)
-            .ethernet_addr(ethernet_addr)
-            .ip_addrs(&mut ip_addrs[..])
-            .neighbor_cache(neighbor_cache)
+        *IP_ADDRS = Some([IpCidr::new(
+            IpAddress::from(Ipv4Address::new(10, 15, 0, 124)),
+            24,
+        )]);
+        *ETH = Some(eth);
+
+        let interface = EthernetInterfaceBuilder::new(ETH.as_mut().unwrap())
+            .ethernet_addr(EthernetAddress(SRC_MAC))
+            .ip_addrs(IP_ADDRS.as_mut().unwrap().as_mut())
+            .neighbor_cache(NeighborCache::new(NEIGHBOR_STORAGE.as_mut()))
             .finalize();
 
         let server_socket = TcpSocket::new(
-            TcpSocketBuffer::new(unsafe { SERVER_RX_BUFFER.as_mut() }),
-            TcpSocketBuffer::new(unsafe { SERVER_TX_BUFFER.as_mut() }),
+            TcpSocketBuffer::new(SERVER_RX_BUFFER.as_mut()),
+            TcpSocketBuffer::new(SERVER_TX_BUFFER.as_mut()),
         );
 
-        let mut sockets = SocketSet::new(unsafe { SOCKETS_STORAGE.as_mut() });
+        let mut sockets = SocketSet::new(SOCKETS_STORAGE.as_mut());
         let server_handle = sockets.add(server_socket);
 
         let usb = USB::new(
@@ -132,21 +149,16 @@ const APP: () = {
             clocks,
         );
 
-        unsafe {
-            *USB_BUS = Some(UsbBus::new(usb, &mut EP_MEMORY[..]));
-        }
+        *USB_BUS = Some(UsbBus::new(usb, &mut EP_MEMORY[..]));
 
-        let serial = usbd_serial::SerialPort::new(unsafe { USB_BUS.as_ref().unwrap() });
+        let serial = usbd_serial::SerialPort::new(USB_BUS.as_ref().unwrap());
 
-        let usb_dev = UsbDeviceBuilder::new(
-            unsafe { USB_BUS.as_ref().unwrap() },
-            UsbVidPid(0x16c0, 0x27dd),
-        )
-        .manufacturer("Fake company")
-        .product("Serial port")
-        .serial_number("TEST")
-        .device_class(usbd_serial::USB_CLASS_CDC)
-        .build();
+        let usb_dev = UsbDeviceBuilder::new(USB_BUS.as_ref().unwrap(), UsbVidPid(0x16c0, 0x27dd))
+            .manufacturer("Fake company")
+            .product("Serial port")
+            .serial_number("TEST")
+            .device_class(usbd_serial::USB_CLASS_CDC)
+            .build();
 
         let now = cx.start;
         cx.schedule.blink(now + PERIOD.cycles()).unwrap();
@@ -156,20 +168,52 @@ const APP: () = {
         init::LateResources {
             green_led,
             blue_led,
+            red_led,
             serial,
             usb_dev,
             server_handle,
             sockets,
+            interface,
         }
     }
 
-    #[idle(resources = [eth_pending, time])]
+    #[idle(resources = [eth_pending, time, interface, sockets, server_handle])]
     fn idle(mut cx: idle::Context) -> ! {
         let pending: &mut bool = cx.resources.eth_pending;
+        let interface: &mut Ethernet = cx.resources.interface;
+        let sockets: &mut Sockets = cx.resources.sockets;
+        let handle: &mut SocketHandle = cx.resources.server_handle;
+
         loop {
             let time: u64 = cx.resources.time.lock(|time| *time);
             *pending = false;
-            cortex_m::asm::nop();
+            match interface.poll(sockets, Instant::from_millis(time as i64)) {
+                Ok(true) => {
+                    let mut socket = sockets.get::<TcpSocket>(*handle);
+                    if !socket.is_open() {
+                        if socket.listen(80).is_err() {
+                            defmt::error!("TCP listen error");
+                        }
+                    }
+
+                    if socket.can_send() {
+                        if write!(socket, "Hello, ethernet!\n")
+                            .map(|_| {
+                                socket.close();
+                            })
+                            .is_err()
+                        {
+                            defmt::error!("TCP send error.");
+                        }
+                    }
+                }
+                Ok(false) => {}
+                Err(e) =>
+                // Ignore malformed packets
+                {
+                    // defmt::error!("Malformed packet.");
+                }
+            }
         }
     }
 
@@ -184,19 +228,17 @@ const APP: () = {
 
         match serial.read(&mut buf[..]) {
             Ok(count) => {
-                defmt::debug!("data: start");
                 for c in buf[..count].iter() {
                     serial.write(&[*c]).unwrap();
-                    defmt::debug!("data {:u8}", c);
+                    defmt::warn!("data {:u8}", c);
                 }
-                defmt::debug!("data: end");
                 // count bytes were read to &buf[..count]
             }
             Err(UsbError::WouldBlock) => {
                 // defmt::debug!("would block.");
             } // No data received
             Err(_) => {
-                defmt::debug!("err.");
+                defmt::warn!("err.");
             } // An error occurred
         };
     }
@@ -234,9 +276,16 @@ const APP: () = {
             .unwrap();
     }
 
-    #[task(resources = [time], schedule = [ms_tick])]
+    #[task(resources = [time, red_led], schedule = [ms_tick])]
     fn ms_tick(cx: ms_tick::Context) {
+        let led: &mut PB<Output<PushPull>> = cx.resources.red_led;
         *cx.resources.time += 1;
+
+        if led.is_low().unwrap() {
+            led.set_high().unwrap();
+        } else {
+            led.set_low().unwrap();
+        }
 
         cx.schedule
             .ms_tick(cx.scheduled + (MS_PERIOD).cycles())
