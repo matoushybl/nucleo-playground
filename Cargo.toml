@@ -8,18 +8,6 @@ version = "0.1.0"
 [workspace]
 members = ["testsuite"]
 
-[dependencies.defmt]
-git = "https://github.com/knurling-rs/defmt"
-branch = "main"
-
-[dependencies.defmt-rtt]
-git = "https://github.com/knurling-rs/defmt"
-branch = "main"
-
-[dependencies.panic-probe]
-git = "https://github.com/knurling-rs/probe-run"
-branch = "main"
-
 [dependencies]
 cortex-m = "0.6.4"
 cortex-m-rt = "0.6.13"
@@ -33,6 +21,9 @@ embedded-dma = "0.1.2"
 usb-device = "0.2.3"
 usbd-serial = "0.1.1"
 stm32-eth = { git = "https://github.com/matoushybl/stm32-eth.git", branch = "update_f7_hal", features = ["stm32f767", "smoltcp-phy"] }
+defmt = "0.1.0"
+defmt-rtt = "0.1.0"
+panic-probe = { version = "0.1.0", features = ["print-defmt"] }
 
 [dependencies.smoltcp]
 version = "0.6.0"

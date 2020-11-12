@@ -2,15 +2,13 @@
 #![no_std]
 
 use cortex_m::peripheral::DWT;
-use embedded_hal::digital::ToggleableOutputPin;
 use nucleo_usb as _;
-use rtic::cyccnt::{Instant, U32Ext as _};
+use rtic::cyccnt::{U32Ext as _};
 use smoltcp::socket::{SocketHandle, SocketSetItem};
 use stm32_eth::smoltcp::iface::{EthernetInterfaceBuilder, NeighborCache};
 use stm32_eth::smoltcp::socket::{SocketSet, TcpSocket, TcpSocketBuffer};
 use stm32_eth::smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
 use stm32_eth::{Eth, EthPins, PhyAddress, RingEntry};
-use stm32f7xx_hal::delay::Delay;
 use stm32f7xx_hal::gpio::gpiob::PB;
 use stm32f7xx_hal::gpio::{Output, PushPull};
 use stm32f7xx_hal::otg_fs::{UsbBus, UsbBusType, USB};
@@ -58,7 +56,7 @@ const APP: () = {
         DWT::unlock();
         core.DWT.enable_cycle_counter();
 
-        let mut rcc = device
+        let rcc = device
             .RCC
             .constrain()
             .cfgr
@@ -115,8 +113,6 @@ const APP: () = {
             .neighbor_cache(neighbor_cache)
             .finalize();
 
-        let mut server_rx_buffer = [0; 2048];
-        let mut server_tx_buffer = [0; 2048];
         let server_socket = TcpSocket::new(
             TcpSocketBuffer::new(unsafe { SERVER_RX_BUFFER.as_mut() }),
             TcpSocketBuffer::new(unsafe { SERVER_TX_BUFFER.as_mut() }),
@@ -140,9 +136,9 @@ const APP: () = {
             *USB_BUS = Some(UsbBus::new(usb, &mut EP_MEMORY[..]));
         }
 
-        let mut serial = usbd_serial::SerialPort::new(unsafe { USB_BUS.as_ref().unwrap() });
+        let serial = usbd_serial::SerialPort::new(unsafe { USB_BUS.as_ref().unwrap() });
 
-        let mut usb_dev = UsbDeviceBuilder::new(
+        let usb_dev = UsbDeviceBuilder::new(
             unsafe { USB_BUS.as_ref().unwrap() },
             UsbVidPid(0x16c0, 0x27dd),
         )
@@ -153,9 +149,9 @@ const APP: () = {
         .build();
 
         let now = cx.start;
-        cx.schedule.blink(now + PERIOD.cycles());
-        cx.schedule.blink_blue(now + PERIOD.cycles());
-        cx.schedule.ms_tick(now + MS_PERIOD.cycles());
+        cx.schedule.blink(now + PERIOD.cycles()).unwrap();
+        cx.schedule.blink_blue(now + PERIOD.cycles()).unwrap();
+        cx.schedule.ms_tick(now + MS_PERIOD.cycles()).unwrap();
 
         init::LateResources {
             green_led,
@@ -199,7 +195,7 @@ const APP: () = {
             Err(UsbError::WouldBlock) => {
                 // defmt::debug!("would block.");
             } // No data received
-            Err(err) => {
+            Err(_) => {
                 defmt::debug!("err.");
             } // An error occurred
         };
@@ -216,9 +212,9 @@ const APP: () = {
     fn blink(cx: blink::Context) {
         let led: &mut PB<Output<PushPull>> = cx.resources.green_led;
         if led.is_low().unwrap() {
-            led.set_high();
+            led.set_high().unwrap();
         } else {
-            led.set_low();
+            led.set_low().unwrap();
         }
 
         cx.schedule.blink(cx.scheduled + PERIOD.cycles()).unwrap();
@@ -228,9 +224,9 @@ const APP: () = {
     fn blink_blue(cx: blink_blue::Context) {
         let led: &mut PB<Output<PushPull>> = cx.resources.blue_led;
         if led.is_low().unwrap() {
-            led.set_high();
+            led.set_high().unwrap();
         } else {
-            led.set_low();
+            led.set_low().unwrap();
         }
 
         cx.schedule
